@@ -11,6 +11,99 @@ on:
   workflow_dispatch:
 
 jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v3
+        name: 'Check out code'
+
+      - uses: actions/setup-java@v3
+        name: 'Set up JDK 21'
+        with:
+          distribution: 'adopt'
+          java-version: '21'
+          cache: 'gradle'
+
+      - uses: nttld/setup-ndk@v1
+        name: 'Set up Android NDK'
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - uses: android-actions/setup-android@v2
+        name: 'Set up Android SDK'
+
+      - shell: bash
+        name: 'Set up Linux build environment'
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install libglu1-mesa-dev libxrandr-dev libdbus-1-dev multistrap -y
+          sudo apt-get install gcc-9 g++-9 -y
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-9 60 --slave /usr/bin/g++ g++ /usr/bin/g++-9
+          sudo update-alternatives --config gcc
+          sudo apt-get install gcc-9-aarch64-linux-gnu g++-9-aarch64-linux-gnu -y
+          sudo update-alternatives --install /usr/bin/aarch64-linux-gnu-gcc aarch64-linux-gnu-gcc /usr/bin/aarch64-linux-gnu-gcc-9 60 --slave /usr/bin/aarch64-linux-gnu-g++ aarch64-linux-gnu-g++ /usr/bin/aarch64-linux-gnu-g++-9
+          sudo update-alternatives --config aarch64-linux-gnu-gcc
+          sudo Xvfb :0 -screen 0 1280x720x24 +extension GLX &
+
+      # We have only ~4.5G left after installing everything required, and sometimes it's not enough to correctly run
+      # skiko compilation and publishing. Removing unused software from the agent to free up space.
+      # (it gives us ~13G)
+      - name: Free up space on GitHub image
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          sudo docker builder prune -a
+          df -h
+
+      - shell: bash
+        name: 'Compile and run Linux x64 tests'
+        run: |
+          export DISPLAY=:0
+          ./gradlew --no-daemon --stacktrace --info -Pskiko.native.enabled=true -Pkotlin.native.cacheKind.linuxX64=none -Dskiko.test.onci=true -Dskiko.test.performance.enabled=false :skiko:linuxX64Test
+
+      # Linux arm64 tests are executed on a separate runner
+      - shell: bash
+        name: 'Compile Linux arm64 tests'
+        run: |
+          ./gradlew --no-daemon --stacktrace --info -Pskiko.native.enabled=true -Dskiko.test.onci=true -Dskiko.test.performance.enabled=false :skiko:linkDebugTestLinuxArm64
+
+      - shell: bash
+        name: 'Compile and run AWT tests'
+        run: |
+          export DISPLAY=:0
+          ./gradlew --no-daemon --stacktrace --info -Pskiko.native.enabled=true -Pkotlin.native.cacheKind.linuxX64=none -Dskiko.test.onci=true -Dskiko.test.performance.enabled=false :skiko:awtTest
+        timeout-minutes: 25
+
+      - shell: bash
+        name: 'Publish to Maven Local, check AWT sample'
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          ./gradlew --no-daemon --stacktrace --info -Pkotlin.native.cacheKind.linuxX64=none :skiko:publishToMavenLocal
+          ./gradlew --no-daemon --stacktrace --info :SkiaAwtSample:installDist
+          ./gradlew --no-daemon -Pskiko.android.enabled=true :skiko:publishSkikoJvmRuntimeAndroidX64PublicationToMavenLocal :skiko:publishSkikoJvmRuntimeAndroidArm64PublicationToMavenLocal :skiko:publishAndroidReleasePublicationToMavenLocal
+
+      - uses: actions/upload-artifact@v4
+        name: 'Save test results as artifact'
+        if: always()
+        with:
+          name: test-reports-linux
+          path: ./skiko/build/reports/tests
+          retention-days: 5
+
+      - uses: actions/upload-artifact@v4
+        name: 'Save linuxArm64 test binary as artifact'
+        with:
+          name: test-binary-linuxArm64
+          path: ./skiko/build/bin/linuxArm64
+          if-no-files-found: error
+          retention-days: 5
   linux-arm:
     needs: linux
     runs-on: ubuntu-22.04-arm
